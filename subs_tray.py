@@ -23,6 +23,10 @@ import importlib.util
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
 try:
     import pystray
     from PIL import Image, ImageDraw
@@ -37,6 +41,11 @@ LANG_PRIORITY = ["ru", "en"]      # предпочтительный язык н
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
 # CREATE_NO_WINDOW - чтобы не мигали чёрные окна консоли при вызове yt-dlp
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# Глобальная горячая клавиша: Ctrl+Alt+Y
+HOTKEY_MODS = 0x0002 | 0x0001   # MOD_CONTROL | MOD_ALT
+HOTKEY_VK   = 0x59               # Virtual-Key code для Y
+HOTKEY_ID   = 1
 # --------------------------------
 
 
@@ -274,6 +283,9 @@ class App:
         self.icon = self._build_icon()
         self.icon.run_detached()             # иконка крутится в фоновом потоке
 
+        if os.name == "nt":
+            threading.Thread(target=self._hotkey_listener, daemon=True).start()
+
         self.root.after(100, self._poll_commands)
 
     # ---- иконка трея ----
@@ -293,6 +305,21 @@ class App:
         )
         return pystray.Icon("SubsToText", self._make_image(), "SubsToText", menu)
 
+    # ---- глобальная горячая клавиша (Ctrl+Alt+Y) ----
+    def _hotkey_listener(self):
+        """Регистрирует горячую клавишу и ждёт WM_HOTKEY в собственном цикле сообщений."""
+        ok = ctypes.windll.user32.RegisterHotKey(None, HOTKEY_ID, HOTKEY_MODS, HOTKEY_VK)
+        if not ok:
+            print("WARNING: не удалось зарегистрировать горячую клавишу Ctrl+Alt+Y")
+            return
+        msg = wintypes.MSG()
+        while ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == 0x0312:  # WM_HOTKEY
+                self.cmd_q.put("download_auto")
+            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+        ctypes.windll.user32.UnregisterHotKey(None, HOTKEY_ID)
+
     # колбэки трея работают в потоке иконки -> просто кладём команду в очередь
     def _on_download(self, icon, item):
         self.cmd_q.put("download")
@@ -307,6 +334,8 @@ class App:
                 cmd = self.cmd_q.get_nowait()
                 if cmd == "download":
                     self._start_download_flow()
+                elif cmd == "download_auto":
+                    self._start_download_auto()
                 elif cmd == "quit":
                     self.icon.stop()
                     self.root.destroy()
@@ -408,20 +437,40 @@ class App:
                 pass
 
             if result["done"]:
-                bar["value"] = 100
-                prog.destroy()
+                if result.get("error"):
+                    prog.grab_release()
+                    tk.Button(prog, text="Закрыть", command=prog.destroy).pack(pady=4)
+                else:
+                    bar["value"] = 100
+                    prog.destroy()
                 on_done(result)
                 return
             prog.after(120, pump)
 
         prog.after(120, pump)
 
+    # ---- быстрый запуск по горячей клавише: URL берётся из буфера ----
+    def _start_download_auto(self):
+        try:
+            url = self.root.clipboard_get().strip()
+        except tk.TclError:
+            url = ""
+        if not url or "youtu" not in url:
+            messagebox.showwarning(
+                "SubsToText",
+                "В буфере обмена нет YouTube-ссылки.\n\nСкопируйте ссылку и нажмите Ctrl+Alt+Y снова.",
+            )
+            return
+        self._run_download_url(url)
+
     # ---- запуск процесса скачивания ----
     def _start_download_flow(self):
         url = self._ask_url()
         if not url:
             return
+        self._run_download_url(url)
 
+    def _run_download_url(self, url: str):
         def worker(log_q, result):
             try:
                 result["path"] = run_download(url, log_q)
