@@ -105,7 +105,8 @@ def run_whisper(url: str, model_size: str, log_q: "queue.Queue") -> str:
         out_template = os.path.join(tmp_dir, "audio.%(ext)s")
         cmd = [
             "yt-dlp",
-            "--cookies-from-browser", BROWSER,
+            *( ["--cookies-from-browser", BROWSER] if BROWSER else [] ),
+            "--remote-components", "ejs:github",
             "--format", "bestaudio[ext=m4a]/bestaudio/best",
             "--no-playlist",
             "-o", out_template,
@@ -166,29 +167,41 @@ def run_whisper(url: str, model_size: str, log_q: "queue.Queue") -> str:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def run_download(url: str, log_q: "queue.Queue") -> str:
+def fetch_subtitle_text(url: str, log_q: "queue.Queue | None", progress_cb=None) -> str:
     """
-    Качает субтитры, чистит, сохраняет .txt в Загрузки.
-    Пишет ход выполнения в log_q. Возвращает путь к готовому .txt.
-    Бросает исключение при ошибке.
+    Качает субтитры и возвращает чистый текст (без сохранения на диск).
+    log_q — очередь для строк/флоатов прогресса (может быть None).
+    progress_cb — опциональный callable(float) для передачи прогресса 0..100.
+    Бросает FileNotFoundError если субтитры не найдены, RuntimeError при других ошибках.
     """
+    def _prog(pct: float):
+        if log_q is not None:
+            log_q.put(pct)
+        if progress_cb is not None:
+            progress_cb(pct)
+
+    def _log(msg: str):
+        if log_q is not None:
+            log_q.put(msg)
+
     tmp_dir = tempfile.mkdtemp(prefix="ytsubs_")
     try:
         out_template = os.path.join(tmp_dir, "subs")
         cmd = [
             "yt-dlp",
-            "--cookies-from-browser", BROWSER,
+            *( ["--cookies-from-browser", BROWSER] if BROWSER else [] ),
+            "--remote-components", "ejs:github",
             "--write-auto-subs",
             "--skip-download",
+            "--no-playlist",
             "--sub-langs", LANGS,
             "-o", out_template,
-            "--newline",                # чтобы прогресс шёл построчно
+            "--newline",
             url,
         ]
-        log_q.put("Starting yt-dlp...\n")
-        log_q.put(3.0)
+        _log("Starting yt-dlp...\n")
+        _prog(3.0)
 
-        # запускаем и читаем вывод построчно в реальном времени
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -198,49 +211,62 @@ def run_download(url: str, log_q: "queue.Queue") -> str:
             errors="replace",
             creationflags=NO_WINDOW,
         )
-        if proc.stdout is not None:          # проверка для типизатора и надёжности
+        if proc.stdout is not None:
             for line in proc.stdout:
-                log_q.put(line)
+                _log(line)
                 l = line.strip()
                 if "Extracting cookies" in l:
-                    log_q.put(8.0)
+                    _prog(8.0)
                 elif "Extracted" in l and "cookies" in l:
-                    log_q.put(15.0)
+                    _prog(15.0)
                 elif "Extracting URL" in l:
-                    log_q.put(22.0)
+                    _prog(22.0)
                 elif "Downloading webpage" in l:
-                    log_q.put(35.0)
+                    _prog(35.0)
                 elif "Downloading android" in l or "Downloading m3u8" in l or "Downloading MPD" in l:
-                    log_q.put(50.0)
+                    _prog(50.0)
                 elif "Downloading subtitles" in l:
-                    log_q.put(65.0)
+                    _prog(65.0)
                 elif "[download] Destination:" in l:
-                    log_q.put(73.0)
+                    _prog(73.0)
                 elif dm := re.match(r"\[download\]\s+([\d.]+)%", l):
-                    log_q.put(73.0 + float(dm.group(1)) * 0.09)  # 73–82%
+                    _prog(73.0 + float(dm.group(1)) * 0.09)
         proc.wait()
 
+        try:
+            vtt_check = pick_vtt(tmp_dir)
+        except FileNotFoundError:
+            if proc.returncode != 0:
+                raise FileNotFoundError("Субтитры не найдены (.vtt отсутствует)")
+            raise
         if proc.returncode != 0:
-            raise RuntimeError("yt-dlp failed (см. лог выше)")
+            _log("(yt-dlp завершился с ошибкой, но субтитры получены — продолжаем)\n")
 
-        log_q.put("Cleaning subtitles...\n")
-        log_q.put(85.0)
-        vtt = pick_vtt(tmp_dir)
-        text = clean_vtt(vtt)
-
-        # имя файла из id видео, если получится
-        m = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", url)
-        name = f"subtitles_{m.group(1)}.txt" if m else "subtitles.txt"
-        os.makedirs(DOWNLOADS, exist_ok=True)
-        out_path = os.path.join(DOWNLOADS, name)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(text)
-
-        log_q.put(f"Saved: {out_path}\n")
-        log_q.put(100.0)
-        return out_path
+        _log("Cleaning subtitles...\n")
+        _prog(85.0)
+        return clean_vtt(vtt_check)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def run_download(url: str, log_q: "queue.Queue") -> str:
+    """
+    Качает субтитры, чистит, сохраняет .txt в Загрузки.
+    Пишет ход выполнения в log_q. Возвращает путь к готовому .txt.
+    Бросает исключение при ошибке.
+    """
+    text = fetch_subtitle_text(url, log_q, progress_cb=None)
+
+    m = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", url)
+    name = f"subtitles_{m.group(1)}.txt" if m else "subtitles.txt"
+    os.makedirs(DOWNLOADS, exist_ok=True)
+    out_path = os.path.join(DOWNLOADS, name)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    log_q.put(f"Saved: {out_path}\n")
+    log_q.put(100.0)
+    return out_path
 
 
 # ======================================================================
@@ -268,6 +294,17 @@ def copy_file_to_clipboard(path: str):
     )
 
 
+def copy_text_to_clipboard(text: str):
+    """Скопировать текст в буфер обмена."""
+    env = os.environ.copy()
+    env["_SUBSTRAY_TEXT"] = text
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value $env:_SUBSTRAY_TEXT"],
+        creationflags=NO_WINDOW,
+        env=env,
+    )
+
+
 # ======================================================================
 #  ИНТЕРФЕЙС (всё в главном потоке)
 # ======================================================================
@@ -289,13 +326,20 @@ class App:
         self.root.after(100, self._poll_commands)
 
     # ---- иконка трея ----
-    def _make_image(self):
-        """Простая иконка: тёмный квадрат с «полосками субтитров»."""
-        img = Image.new("RGB", (64, 64), (32, 34, 40))
+    def _make_image(self, progress: float | None = None):
+        """Иконка с тремя полосками субтитров. progress=0..100 рисует дугу прогресса по кругу."""
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         d.rounded_rectangle([6, 6, 58, 58], radius=10, fill=(45, 48, 56))
-        for y in (24, 34, 44):                # три строки субтитров
+        for y in (24, 34, 44):
             d.rounded_rectangle([16, y, 48, y + 5], radius=2, fill=(120, 200, 160))
+        if progress is not None:
+            # тонкое серое кольцо-фон
+            d.arc([4, 4, 60, 60], start=0, end=360, fill=(70, 73, 80), width=4)
+            # зелёная дуга прогресса (от 12 часов по часовой стрелке)
+            end_angle = -90 + (progress / 100) * 360
+            if progress > 0:
+                d.arc([4, 4, 60, 60], start=-90, end=end_angle, fill=(120, 200, 160), width=4)
         return img
 
     def _build_icon(self):
@@ -456,12 +500,35 @@ class App:
         except tk.TclError:
             url = ""
         if not url or "youtu" not in url:
-            messagebox.showwarning(
-                "SubsToText",
-                "В буфере обмена нет YouTube-ссылки.\n\nСкопируйте ссылку и нажмите Ctrl+Alt+Y снова.",
-            )
+            self.icon.notify("В буфере обмена нет YouTube-ссылки", "SubsToText")
             return
-        self._run_download_url(url)
+        self._run_auto_silent(url)
+
+    def _run_auto_silent(self, url: str):
+        """Тихое скачивание без окна прогресса — прогресс на иконке трея, результат в буфер."""
+        def on_progress(pct: float):
+            self.icon.icon = self._make_image(progress=pct)
+            self.icon.title = f"SubsToText — {pct:.0f}%"
+
+        def reset_icon():
+            self.icon.icon = self._make_image()
+            self.icon.title = "SubsToText"
+
+        def worker():
+            try:
+                text = fetch_subtitle_text(url, log_q=None, progress_cb=on_progress)
+                copy_text_to_clipboard(text)
+                words = len(text.split())
+                reset_icon()
+                self.icon.notify(f"Субтитры скопированы (~{words} слов)", "SubsToText")
+            except FileNotFoundError:
+                reset_icon()
+                self.icon.notify("Субтитры не найдены", "SubsToText")
+            except Exception as e:  # noqa: BLE001
+                reset_icon()
+                self.icon.notify(f"Ошибка: {e}", "SubsToText")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---- запуск процесса скачивания ----
     def _start_download_flow(self):
