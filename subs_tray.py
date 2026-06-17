@@ -6,6 +6,9 @@ SubsToText - приложение в трее Windows.
 После успеха: открыть папку / открыть файл / скопировать файл в буфер.
 
 Зависимости: pip install pystray pillow
+Опционально (локальная транскрибация, если нет субтитров): pip install faster-whisper
+Опционально (ускорение Whisper на GPU, только NVIDIA; без них — работа на CPU):
+    pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 В системе уже должны стоять: yt-dlp, deno (JS-движок).
 """
 
@@ -19,6 +22,7 @@ import tempfile
 import threading
 import subprocess
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -36,11 +40,20 @@ except ImportError:
 
 # ---------- настройки ----------
 BROWSER = "firefox"               # откуда брать cookies
-LANGS = "ru,en"                   # языки субтитров
+LANGS = "ru,en"                   # языки субтитров (доступные для выбора)
 LANG_PRIORITY = ["ru", "en"]      # предпочтительный язык на выходе
+LANG_NAMES = {"ru": "Русский", "en": "English"}   # подписи в интерфейсе
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
 # CREATE_NO_WINDOW - чтобы не мигали чёрные окна консоли при вызове yt-dlp
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# Повтор при сбоях скачивания субтитров (например HTTP 429 Too Many Requests)
+SUB_RETRIES = 5        # число попыток
+SUB_RETRY_SLEEP = 5    # пауза между попытками, секунд
+
+# Сколько видео плейлиста качать параллельно (1 = последовательно).
+# Больше потоков = быстрее, но выше риск HTTP 429 от YouTube.
+PLAYLIST_WORKERS = 4
 
 # Глобальная горячая клавиша: Ctrl+Alt+Y
 HOTKEY_MODS = 0x0002 | 0x0001   # MOD_CONTROL | MOD_ALT
@@ -96,6 +109,42 @@ def whisper_available() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
+def _register_cuda_dlls() -> None:
+    """Подгружает CUDA-библиотеки из pip-пакетов nvidia-* в текущий процесс.
+
+    DLL (cublas64_12.dll / cudnn*.dll) лежат в site-packages\\nvidia\\...\\bin,
+    которых нет в путях поиска. Одного os.add_dll_directory CTranslate2 на
+    Windows недостаточно — он не находит cublas, поэтому предзагружаем ключевые
+    библиотеки явно через ctypes.WinDLL. Тихо игнорируем, если пакетов нет
+    (тогда сработает откат на CPU в run_whisper)."""
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    import sysconfig  # noqa: PLC0415
+
+    nvidia_root = os.path.join(sysconfig.get_paths()["purelib"], "nvidia")
+    if not os.path.isdir(nvidia_root):
+        return
+    # Сначала добавляем все bin-папки, чтобы предзагрузка нашла зависимости.
+    bin_dirs = []
+    for pkg in os.listdir(nvidia_root):
+        bin_dir = os.path.join(nvidia_root, pkg, "bin")
+        if os.path.isdir(bin_dir):
+            bin_dirs.append(bin_dir)
+            try:
+                os.add_dll_directory(bin_dir)
+            except OSError:
+                pass
+    # Предзагружаем cublas/cudnn по полному пути, чтобы они уже были в процессе.
+    for bin_dir in bin_dirs:
+        for name in ("cublas64_12.dll", "cudnn64_9.dll"):
+            dll = os.path.join(bin_dir, name)
+            if os.path.isfile(dll):
+                try:
+                    ctypes.WinDLL(dll)
+                except OSError:
+                    pass
+
+
 def run_whisper(url: str, model_size: str, log_q: "queue.Queue") -> str:
     """Скачивает аудио и транскрибирует через faster-whisper. Возвращает путь к .txt."""
     from faster_whisper import WhisperModel  # noqa: PLC0415
@@ -138,8 +187,19 @@ def run_whisper(url: str, model_size: str, log_q: "queue.Queue") -> str:
 
         log_q.put(f"Транскрибируем (модель: {model_size})...\n")
         log_q.put(42.0)
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(audio_path, beam_size=5)
+        _register_cuda_dlls()
+        try:
+            # cublas/cudnn подгружаются лениво на первом transcribe(), поэтому
+            # пробный прогон делаем здесь же — иначе сбой GPU не поймать.
+            model = WhisperModel(model_size, device="cuda", compute_type="float16")
+            segments, info = model.transcribe(audio_path, beam_size=5)
+            info.language  # форсируем работу, чтобы поймать ошибку загрузки CUDA
+            log_q.put("Устройство: GPU (CUDA, float16)\n")
+        except Exception as e:  # noqa: BLE001 — нет CUDA/драйверов/библиотек → откат на CPU
+            log_q.put(f"GPU недоступен ({e}); работаем на CPU\n")
+            model = WhisperModel(model_size, device="cpu", compute_type="int8")
+            segments, info = model.transcribe(audio_path, beam_size=5)
+            log_q.put("Устройство: CPU (int8)\n")
         log_q.put(f"Язык: {info.language} ({info.language_probability:.0%})\n")
         log_q.put(45.0)
 
@@ -269,6 +329,158 @@ def run_download(url: str, log_q: "queue.Queue") -> str:
     return out_path
 
 
+# форсируем UTF-8 в выводе yt-dlp, иначе кириллица в путях/логе бьётся в "ромбики"
+def _utf8_env() -> dict:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
+def _list_playlist_videos(url: str, env: dict, log_q: "queue.Queue") -> "list[str]":
+    """Быстро (без скачивания) получает список id видео канала / плейлиста."""
+    cmd = [
+        "yt-dlp",
+        *( ["--cookies-from-browser", BROWSER] if BROWSER else [] ),
+        "--flat-playlist",
+        "--print", "%(id)s",
+        "--yes-playlist",
+        url,
+    ]
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=NO_WINDOW, env=env,
+    )
+    ids = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not ids:
+        raise RuntimeError("Не удалось получить список видео (проверьте ссылку и cookies)")
+    return ids
+
+
+def _download_one_video(video_url: str, langs: str, out_template: str,
+                        env: dict, log_q: "queue.Queue") -> "list[str]":
+    """Качает субтитры одного видео. Возвращает пути записанных .vtt."""
+    cmd = [
+        "yt-dlp",
+        *( ["--cookies-from-browser", BROWSER] if BROWSER else [] ),
+        "--remote-components", "ejs:github",
+        "--write-auto-subs",
+        "--skip-download",
+        "--no-playlist",
+        "--sub-langs", langs,
+        # повторяем сбойные запросы (HTTP 429 и т.п.) с фиксированным кулдауном
+        "--retries", str(SUB_RETRIES),
+        "--retry-sleep", str(SUB_RETRY_SLEEP),
+        "-o", out_template,
+        "--newline",
+        video_url,
+    ]
+    written: list[str] = []
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=NO_WINDOW, env=env,
+    )
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            log_q.put(line)
+            wm = re.search(r"Writing video subtitles to:\s*(.+\.vtt)\s*$", line)
+            if wm:
+                written.append(wm.group(1).strip())
+    proc.wait()
+    return written
+
+
+def run_download_playlist(url: str, langs: str, log_q: "queue.Queue") -> str:
+    """
+    Пакетно качает авто-субтитры со всего канала / плейлиста.
+    langs - языки для скачивания (формат yt-dlp, например "ru" или "ru,en").
+    Видео качаются в PLAYLIST_WORKERS параллельных потоков (1 = последовательно).
+    Раскладывает файлы по подпапкам вида <канал>/<название> в Загрузках.
+    Скачанные .vtt чистятся в .txt (как для одиночного видео), сами .vtt удаляются.
+    Возвращает путь к папке Загрузок.
+    """
+    os.makedirs(DOWNLOADS, exist_ok=True)
+    # шаблон вывода: Загрузки/<канал>/<название видео>.<ext>
+    out_template = os.path.join(DOWNLOADS, "%(channel)s", "%(title)s.%(ext)s")
+    env = _utf8_env()
+
+    log_q.put("Fetching playlist items...\n")
+    log_q.put(2.0)
+    ids = _list_playlist_videos(url, env, log_q)
+    total = len(ids)
+    log_q.put(f"Found {total} video(s), downloading with {PLAYLIST_WORKERS} worker(s)...\n")
+    log_q.put(5.0)
+
+    # параллельно качаем субтитры по каждому видео
+    written_vtts: list[str] = []
+    workers = max(1, PLAYLIST_WORKERS)
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                _download_one_video,
+                f"https://www.youtube.com/watch?v={vid}", langs, out_template, env, log_q,
+            )
+            for vid in ids
+        ]
+        for fut in as_completed(futures):
+            try:
+                written_vtts.extend(fut.result())
+            except Exception as e:  # noqa: BLE001
+                log_q.put(f"Video failed: {e}\n")
+            done += 1
+            # прогресс: скачивание занимает диапазон 5..95%
+            log_q.put(5.0 + (done / total) * 90.0)
+
+    # чистим .vtt в .txt: по одному файлу на видео (язык — по LANG_PRIORITY)
+    log_q.put("Cleaning subtitles...\n")
+    log_q.put(95.0)
+    # группируем .vtt одного видео, отрезая суффикс ".<язык>.vtt"
+    groups: dict[str, list[str]] = {}
+    for vtt in written_vtts:
+        base = re.sub(r"\.[A-Za-z-]+\.vtt$", "", vtt)
+        groups.setdefault(base, []).append(vtt)
+
+    def _lang_of(path: str) -> str:
+        lm = re.search(r"\.([A-Za-z-]+)\.vtt$", path)
+        return lm.group(1) if lm else ""
+
+    count = 0
+    for base, vtts in groups.items():
+        # выбираем язык по приоритету, иначе первый попавшийся
+        chosen = next(
+            (v for lang in LANG_PRIORITY for v in vtts if _lang_of(v) == lang),
+            vtts[0],
+        )
+        try:
+            text = clean_vtt(chosen)
+            with open(base + ".txt", "w", encoding="utf-8") as f:
+                f.write(text)
+            count += 1
+        except Exception as e:  # noqa: BLE001
+            log_q.put(f"Skip (clean failed): {chosen} ({e})\n")
+            continue
+        # удаляем исходные .vtt этого видео (оставляем только .txt)
+        for v in vtts:
+            try:
+                os.remove(v)
+            except OSError:
+                pass
+
+    # ошибка только если совсем ничего не сохранили; частичные сбои (например
+    # HTTP 429 по части видео) не считаем фатальными - что скачалось, то очистили
+    if count == 0:
+        raise RuntimeError("yt-dlp завершился с ошибкой, субтитры не получены")
+
+    log_q.put(f"Done: {count} of {total} file(s) saved to {DOWNLOADS}\n")
+    log_q.put(100.0)
+    return DOWNLOADS
+
+
 # ======================================================================
 #  ДЕЙСТВИЯ С ГОТОВЫМ ФАЙЛОМ (Windows)
 # ======================================================================
@@ -345,6 +557,7 @@ class App:
     def _build_icon(self):
         menu = pystray.Menu(
             pystray.MenuItem("Скачать субтитры", self._on_download, default=True),
+            pystray.MenuItem("Скачать с канала / плейлиста", self._on_download_playlist),
             pystray.MenuItem("Выход", self._on_quit),
         )
         return pystray.Icon("SubsToText", self._make_image(), "SubsToText", menu)
@@ -368,6 +581,9 @@ class App:
     def _on_download(self, icon, item):
         self.cmd_q.put("download")
 
+    def _on_download_playlist(self, icon, item):
+        self.cmd_q.put("download_playlist")
+
     def _on_quit(self, icon, item):
         self.cmd_q.put("quit")
 
@@ -380,6 +596,8 @@ class App:
                     self._start_download_flow()
                 elif cmd == "download_auto":
                     self._start_download_auto()
+                elif cmd == "download_playlist":
+                    self._start_playlist_flow()
                 elif cmd == "quit":
                     self.icon.stop()
                     self.root.destroy()
@@ -448,6 +666,80 @@ class App:
 
         self.root.wait_window(win)   # ждём закрытия окна
         return result["url"] or None
+
+    # ---- окно ввода ссылки на канал / плейлист ----
+    def _ask_url_playlist(self) -> "tuple[str, str] | None":
+        win = tk.Toplevel(self.root)
+        win.title("Канал / плейлист")
+        win.geometry("500x180")
+        win.attributes("-topmost", True)
+        win.grab_set()
+
+        tk.Label(win, text="Вставьте ссылку на канал или плейлист YouTube:").pack(pady=(14, 4))
+        var = tk.StringVar()
+
+        # автоподстановка ссылки из буфера, если она youtube-овская
+        try:
+            clip = self.root.clipboard_get()
+            if "youtu" in clip:
+                var.set(clip.strip())
+        except tk.TclError:
+            pass
+
+        entry = tk.Entry(win, textvariable=var, width=64)
+        entry.pack(padx=14)
+        entry.focus_set()
+        entry.icursor(tk.END)
+
+        def _paste(e=None):
+            try:
+                entry.delete(0, "end")
+                entry.insert(0, win.clipboard_get())
+            except tk.TclError:
+                pass
+            return "break"
+
+        entry.bind("<<Paste>>", _paste)
+        def _select_all(e=None):
+            entry.select_range(0, "end")
+            entry.icursor("end")
+            return "break"
+
+        # keycode 86 = V, 65 = A — независимо от раскладки (ru/en)
+        entry.bind("<<SelectAll>>", _select_all)
+        entry.bind("<Control-KeyPress>", lambda e: _paste() if e.keycode == 86 else _select_all() if e.keycode == 65 else None)
+
+        # выбор языка субтитров: качаем только один, как выбрали
+        avail = [code.strip() for code in LANGS.split(",") if code.strip()]
+        lang_var = tk.StringVar(value=LANG_PRIORITY[0] if LANG_PRIORITY[0] in avail else avail[0])
+        frame_lang = tk.Frame(win)
+        frame_lang.pack(pady=(12, 0))
+        tk.Label(frame_lang, text="Язык субтитров:").pack(side="left", padx=(0, 6))
+        for code in avail:
+            label = LANG_NAMES.get(code, code)
+            tk.Radiobutton(frame_lang, text=label, variable=lang_var, value=code).pack(side="left", padx=3)
+
+        result: dict[str, str | None] = {"url": None, "lang": None}
+
+        def ok():
+            result["url"] = var.get().strip()
+            result["lang"] = lang_var.get()
+            win.destroy()
+
+        def cancel():
+            win.destroy()
+
+        btns = tk.Frame(win)
+        btns.pack(pady=12)
+        tk.Button(btns, text="Скачать всё", width=12, command=ok).pack(side="left", padx=6)
+        tk.Button(btns, text="Отмена", width=12, command=cancel).pack(side="left", padx=6)
+        win.bind("<Return>", lambda e: ok())
+        win.bind("<Escape>", lambda e: cancel())
+
+        self.root.wait_window(win)   # ждём закрытия окна
+        if not result["url"]:
+            return None
+        return result["url"], result["lang"] or avail[0]
 
     # ---- общий каркас: окно прогресса + фоновый воркер ----
     def _run_with_progress(self, title: str, worker_fn, on_done):
@@ -562,6 +854,37 @@ class App:
                 self._show_result(str(result["path"]))
 
         self._run_with_progress("SubsToText - скачивание...", worker, on_done)
+
+    # ---- запуск пакетного скачивания канала / плейлиста ----
+    def _start_playlist_flow(self):
+        answer = self._ask_url_playlist()
+        if not answer:
+            return
+        url, lang = answer
+        self._run_download_playlist(url, lang)
+
+    def _run_download_playlist(self, url: str, lang: str):
+        def worker(log_q, result):
+            try:
+                result["path"] = run_download_playlist(url, lang, log_q)
+            except Exception as e:  # noqa: BLE001
+                result["error"] = str(e)
+            finally:
+                result["done"] = True
+
+        def on_done(result):
+            if result["error"]:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Не удалось скачать субтитры с канала / плейлиста:\n\n"
+                    + str(result["error"])
+                    + "\n\nПроверьте ссылку, cookies (Firefox) и доступность видео.",
+                )
+            else:
+                # открываем папку Загрузок в Проводнике
+                subprocess.run(["explorer", os.path.normpath(str(result["path"]))])
+
+        self._run_with_progress("SubsToText - скачивание плейлиста...", worker, on_done)
 
     # ---- окно результата: что делать с готовым файлом ----
     def _show_result(self, path: str):
